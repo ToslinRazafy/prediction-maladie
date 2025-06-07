@@ -1,332 +1,654 @@
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-import pandas as pd
+from tkinter import messagebox, ttk, filedialog
+from tkinter import Label, Frame, Scrollbar, Text
 import numpy as np
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder, MultiLabelBinarizer
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Dense, Dropout
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Dense, Input, Dropout
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.regularizers import l2
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split, KFold
+from sklearn.metrics import confusion_matrix, classification_report
+import logging
+import threading
+import os
+import pickle
+import pandas as pd
+from datetime import datetime
+import re
+from collections import Counter
+from nltk.corpus import stopwords
+import nltk
+import spacy
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import io
-from contextlib import redirect_stdout
-import unicodedata
-from fuzzywuzzy import fuzz, process
+import random
+import csv
 
-class DiseasePredictionApp:
+# Télécharger les stop-words et charger le modèle spaCy
+nltk.download('stopwords')
+french_stop_words = stopwords.words('french')
+nlp = spacy.load("fr_core_news_sm", disable=['parser', 'ner'])
+
+# Configurer les logs
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+log_handler = logging.StreamHandler()
+logger.addHandler(log_handler)
+
+# Désactiver oneDNN pour éviter les messages inutiles
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# Classes de maladies
+DISEASES = ['grippe', 'rhume', 'gastroentérite', 'migraine']
+label_encoder = LabelEncoder()
+label_encoder.fit(DISEASES)
+
+# Chemins pour sauvegarder le modèle et le vectoriseur
+MODEL_PATH = "disease_model.keras"
+VECTORIZER_PATH = "vectorizer.pkl"
+
+# Dictionnaire de synonymes pour les symptômes
+synonyms = {
+    'fièvre': ['température', 'chaleur', 'hyperthermie'],
+    'toux': ['quinte', 'toux sèche', 'toux grasse'],
+    'fatigue': ['épuisement', 'lassitude', 'faiblesse'],
+    'mal_de_tête': ['céphalée', 'migraine', 'douleur crânienne'],
+    'diarrhée': ['selles liquides', 'troubles intestinaux', 'évacuations fréquentes'],
+    'nausée': ['envie de vomir', 'malaise', 'écœurement']
+}
+
+# Nettoyage du texte avec augmentation
+def preprocess_text(text, augment=False):
+    try:
+        if not isinstance(text, str) or not text.strip():
+            logger.warning("Texte vide ou invalide, retour à une chaîne vide.")
+            return ""
+        text = text.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)  # Supprime ponctuations
+        text = re.sub(r'\d+', '', text)  # Supprime chiffres
+        text = re.sub(r'\s+', ' ', text).strip()  # Normalise espaces
+        doc = nlp(text)
+        tokens = [token.lemma_ for token in doc if token.text not in french_stop_words]
+        
+        if augment and len(tokens) > 2:
+            if random.random() < 0.5:
+                tokens = [random.choice(['très', 'vraiment', '']) + ' ' + w for w in tokens]
+            text = ' '.join(tokens).strip()
+        else:
+            text = ' '.join(tokens).strip()
+        
+        logger.debug(f"Texte prétraité : {text}")
+        return text
+    except Exception as e:
+        logger.error(f"Erreur lors du prétraitement du texte : {e}")
+        return ""
+
+# Augmenter les données
+def augment_dataset(texts, labels):
+    augmented_texts = []
+    augmented_labels = []
+    for text, label in zip(texts, labels):
+        augmented_texts.append(text)
+        augmented_labels.append(label)
+        for _ in range(2):  # Générer 2 versions augmentées par texte
+            aug_text = preprocess_text(text, augment=True)
+            if aug_text:
+                words = aug_text.split()
+                for i, word in enumerate(words):
+                    for key, syn_list in synonyms.items():
+                        if word in syn_list or word == key:
+                            words[i] = random.choice(syn_list)
+                            break
+                aug_text = ' '.join(words)
+                augmented_texts.append(aug_text)
+                augmented_labels.append(label)
+    return augmented_texts, augmented_labels
+
+# Charger les données depuis un CSV
+def load_csv_data(file_path):
+    try:
+        df = pd.read_csv(file_path, quoting=csv.QUOTE_ALL)
+        if 'text' not in df.columns or 'disease' not in df.columns:
+            raise ValueError("Le fichier CSV doit contenir les colonnes 'text' et 'disease'.")
+        df['text'] = df['text'].apply(preprocess_text)
+        df = df[df['text'].str.strip() != ""]
+        
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['disease'])
+        
+        texts = train_df['text'].tolist()
+        labels = train_df['disease'].tolist()
+        
+        texts, labels = augment_dataset(texts, labels)
+        
+        test_texts = test_df['text'].tolist()
+        test_labels = test_df['disease'].tolist()
+        
+        invalid_labels = [label for label in labels + test_labels if label not in DISEASES]
+        if invalid_labels:
+            raise ValueError(f"Étiquettes invalides trouvées : {invalid_labels}")
+        
+        logger.info(f"Répartition des maladies après augmentation (entraînement) : {Counter(labels)}")
+        logger.info(f"Répartition des maladies (test) : {Counter(test_labels)}")
+        return texts, labels, test_texts, test_labels
+    except Exception as e:
+        logger.error(f"Erreur lors du chargement du fichier CSV : {e}")
+        return None, None, None, None
+
+# Initialisation du vectoriseur
+def initialize_vectorizer(texts):
+    try:
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words=french_stop_words, ngram_range=(1, 2))
+        vectorizer.fit(texts)
+        with open(VECTORIZER_PATH, 'wb') as f:
+            pickle.dump(vectorizer, f)
+        logger.info("Vectoriseur TF-IDF initialisé et sauvegardé.")
+        logger.debug(f"Mots du vocabulaire : {list(vectorizer.vocabulary_.keys())[:10]}")
+        return vectorizer
+    except Exception as e:
+        logger.error(f"Erreur lors de l'initialisation du vectoriseur : {e}")
+        return None
+
+# Extraction des caractéristiques texte
+def extract_text_features(text, vectorizer):
+    try:
+        text = preprocess_text(text)
+        if not text or text.strip() == "":
+            logger.warning("Aucun texte valide après prétraitement, retour à une valeur par défaut.")
+            return np.zeros((1, len(vectorizer.vocabulary_)))
+        features = vectorizer.transform([text]).toarray()
+        return features
+    except Exception as e:
+        logger.error(f"Erreur dans l'extraction des caractéristiques texte : {e}")
+        return np.zeros((1, len(vectorizer.vocabulary_)))
+
+# Analyse des erreurs
+def analyze_errors(model, vectorizer, test_texts, test_labels):
+    X_test = vectorizer.transform(test_texts).toarray()
+    y_test = label_encoder.transform(test_labels)
+    predictions = model.predict(X_test, verbose=0)
+    predicted_labels = np.argmax(predictions, axis=1)
+    errors = [(test_texts[i], test_labels[i], label_encoder.inverse_transform([predicted_labels[i]])[0])
+              for i in range(len(test_texts)) if predicted_labels[i] != y_test[i]]
+    for text, true_label, pred_label in errors:
+        logger.info(f"Erreur : Texte='{text}', Vrai={true_label}, Prédit={pred_label}")
+    return errors
+
+# Création et entraînement du modèle
+def create_and_train_model(text_dim, training_texts, training_labels, test_texts, test_labels, progress_callback=None, log_callback=None, app=None):
+    try:
+        if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
+            logger.info("Chargement du modèle existant...")
+            return load_model(MODEL_PATH), None
+        
+        vectorizer = TfidfVectorizer(max_features=1000, stop_words=french_stop_words, ngram_range=(1, 2))
+        vectorizer.fit(training_texts)
+        with open(VECTORIZER_PATH, 'wb') as f:
+            pickle.dump(vectorizer, f)
+        logger.info("Vectoriseur TF-IDF initialisé et sauvegardé.")
+        
+        X = vectorizer.transform(training_texts).toarray()
+        y = label_encoder.transform(training_labels)
+        X_test = vectorizer.transform(test_texts).toarray()
+        y_test = label_encoder.transform(test_labels)
+        
+        text_input = Input(shape=(text_dim,), name='text_input')
+        x = Dense(60, activation='relu', kernel_regularizer=l2(0.02))(text_input)
+        x = Dropout(0.5)(x)
+        output = Dense(len(DISEASES), activation='softmax')(x)
+        
+        model = Model(inputs=text_input, outputs=output)
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
+                     loss='sparse_categorical_crossentropy',
+                     metrics=['accuracy'])
+        
+        kf = KFold(n_splits=10, shuffle=True, random_state=42)
+        val_accuracies = []
+        histories = []
+        
+        for fold, (train_idx, val_idx) in enumerate(kf.split(X)):
+            X_train, X_val = X[train_idx], X[val_idx]
+            y_train, y_val = y[train_idx], y[val_idx]
+            
+            early_stopping = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
+            reduce_lr = ReduceLROnPlateau(monitor='val_loss', factor=0.2, patience=5, min_lr=1e-5)
+            
+            class ProgressCallback(tf.keras.callbacks.Callback):
+                def on_epoch_end(self, epoch, logs=None):
+                    progress = (epoch + 1) / 20 * 100
+                    if progress_callback:
+                        progress_callback(progress)
+                    if log_callback:
+                        log_callback(f"Fold {fold+1} Époque {epoch + 1}/20 - Perte: {logs['loss']:.4f}, "
+                                    f"Précision: {logs['accuracy']:.4f}, Validation Perte: {logs['val_loss']:.4f}, "
+                                    f"Validation Précision: {logs['val_accuracy']:.4f}")
+            
+            history = model.fit(X_train, y_train, epochs=20, batch_size=8, validation_data=(X_val,y_val),
+                               verbose=0, callbacks=[ProgressCallback(), early_stopping, reduce_lr])
+            
+            val_accuracies.append(history.history['val_accuracy'][-1])
+            histories.append(history.history)
+            log_callback(f"Fold {fold+1} - Précision validation : {history.history['val_accuracy'][-1]:.4f}")
+        
+        test_loss, test_accuracy = model.evaluate(X_test, y_test, verbose=0)
+        log_callback(f"Précision sur le jeu de test : {test_accuracy:.4f}, Perte sur le jeu de test : {test_loss:.4f}")
+        
+        predictions = np.argmax(model.predict(X_test, verbose=0), axis=1)
+        cm = confusion_matrix(y_test, predictions)
+        log_callback(f"Matrice de confusion :\n{cm}")
+        log_callback(classification_report(y_test, predictions, target_names=DISEASES))
+        
+        if app:
+            app.root.after(0, lambda: app.plot_confusion_matrix(cm, DISEASES))
+        
+        errors = analyze_errors(model, vectorizer, test_texts, test_labels)
+        log_callback(f"Nombre d'erreurs sur le jeu de test : {len(errors)}")
+        
+        model.save(MODEL_PATH)
+        logger.info("Modèle entraîné et sauvegardé.")
+        return model, {'val_accuracy': val_accuracies, 'history': histories, 'test_accuracy': test_accuracy}
+    except Exception as e:
+        logger.error(f"Erreur lors de la création ou de l'entraînement du modèle : {e}")
+        return None, None
+
+# Prédiction
+def predict_disease(model, text, vectorizer):
+    try:
+        if model is None:
+            raise ValueError("Le modèle n'est pas initialisé.")
+        
+        text_features = extract_text_features(text, vectorizer)
+        text_features = text_features.reshape(1, -1)
+        
+        prediction = model.predict(text_features, verbose=0)
+        disease_index = np.argmax(prediction)
+        disease = label_encoder.inverse_transform([disease_index])[0]
+        probabilities = prediction[0]
+        logger.debug(f"Prédiction pour '{text}' : {disease}, Probabilités : {probabilities}")
+        return disease, probabilities
+    except Exception as e:
+        logger.error(f"Erreur lors de la prédiction : {e}")
+        return None, None
+
+# Interface Tkinter
+class DiseaseApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Prédiction de Maladie avec TensorFlow")
-        self.root.geometry("1000x700")
-        self.root.configure(bg="#f0f4f8")https://github.com/ToslinRazafy/prediction-maladie
-
+        self.root.title("Analyseur de Maladies IA (Version Optimisée)")
+        self.root.geometry("1000x800")
+        self.root.configure(bg="#f0f4f8")
+        
         self.model = None
-        self.scaler = StandardScaler()
-        self.label_encoder = LabelEncoder()
-        self.mlb = MultiLabelBinarizer()
-        self.X_train = None
-        self.y_train = None
-        self.X_test = None
-        self.y_test = None
+        self.vectorizer = None
+        self.training_texts = []
+        self.training_labels = []
+        self.test_texts = []
+        self.test_labels = []
         self.history = None
-        self.feature_names = ['Age', 'Sexe']
-        self.symptom_names = []
-        self.classes = []
-        self.class_colors = {}
-        self.default_colors = ['#28a745', '#dc3545', '#fd7e14', '#17a2b8', '#ffc107']
-
-        self.create_widgets()
-
-    def create_widgets(self):
-        style = ttk.Style()
-        style.theme_use('clam')
-        style.configure("TButton", padding=8, font=("Helvetica", 11, "bold"), background="#007bff", foreground="white", borderwidth=1, relief="flat")
-        style.map("TButton", background=[('active', '#0056b3')])
-        style.configure("TLabel", font=("Helvetica", 11), background="#f0f4f8")
-        style.configure("TEntry", padding=6, font=("Helvetica", 11), relief="flat", background="#ffffff", borderwidth=1)
-        style.configure("TCombobox", padding=6, font=("Helvetica", 11), fieldbackground="#ffffff")
-        style.configure("TNotebook", background="#f0f4f8")
-        style.configure("TNotebook.Tab", font=("Helvetica", 11, "bold"), padding=[10, 5], background="#d1e7ff")
-        style.map("TNotebook.Tab", background=[('selected', '#007bff'), ('active', '#b3d7ff')])
-
-        main_frame = ttk.Frame(self.root, padding="15")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-
-        self.notebook = ttk.Notebook(main_frame)
-        self.notebook.pack(fill=tk.BOTH, expand=True, pady=10)
-
-        self.prediction_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.prediction_frame, text="Prédiction")
-
-        self.training_frame = ttk.Frame(self.notebook)
-        self.notebook.add(self.training_frame, text="Entraînement")
-
-        self.setup_prediction_tab()
-        self.setup_training_tab()
-
-    def setup_training_tab(self):
-        dataset_frame = ttk.LabelFrame(self.training_frame, text="Chargement des Données", padding=10)
-        dataset_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Button(dataset_frame, text="Charger Dataset (CSV)", command=self.load_dataset).pack(pady=10)
-
-        params_frame = ttk.LabelFrame(self.training_frame, text="Paramètres d'Entraînement", padding=10)
-        params_frame.pack(fill=tk.X, padx=10, pady=5)
-
-        ttk.Label(params_frame, text="Nombre d'époques :").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.epochs_entry = ttk.Entry(params_frame, width=10)
-        self.epochs_entry.insert(0, "100")
-        self.epochs_entry.grid(row=0, column=1, padx=5, pady=5)
-
-        ttk.Label(params_frame, text="Taille du lot :").grid(row=1, column=0, padx=5, pady=5, sticky="w")
-        self.batch_size_entry = ttk.Entry(params_frame, width=10)
-        self.batch_size_entry.insert(0, "32")
-        self.batch_size_entry.grid(row=1, column=1, padx=5, pady=5)
-
-        ttk.Button(params_frame, text="Entraîner Modèle", command=self.train_model).grid(row=2, column=0, columnspan=2, pady=10)
-
-        logs_frame = ttk.LabelFrame(self.training_frame, text="Logs d'Entraînement", padding=10)
-        logs_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.log_text = tk.Text(logs_frame, height=8, width=80, font=("Courier", 10), bg="#ffffff", relief="flat", borderwidth=1)
-        self.log_text.pack(pady=5, fill=tk.BOTH, expand=True)
-        scrollbar = ttk.Scrollbar(logs_frame, orient=tk.VERTICAL, command=self.log_text.yview)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-        self.log_text.config(yscrollcommand=scrollbar.set)
-
-        results_frame = ttk.LabelFrame(self.training_frame, text="Résultats", padding=10)
-        results_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        self.result_label = ttk.Label(results_frame, text="", font=("Helvetica", 12))
-        self.result_label.pack(pady=5)
-
-        self.figure, self.ax = plt.subplots(figsize=(6, 4), dpi=100)
-        self.canvas = FigureCanvasTkAgg(self.figure, master=results_frame)
-        self.canvas.get_tk_widget().pack(pady=5, fill=tk.BOTH, expand=True)
-
-    def setup_prediction_tab(self):
-        input_frame = ttk.LabelFrame(self.prediction_frame, text="Entrée des Données", padding=15)
-        input_frame.pack(fill=tk.X, padx=10, pady=10)
-
-        self.input_frame = ttk.Frame(input_frame)
-        self.input_frame.pack(pady=10)
-
-        self.input_entries = []
-        for i, feature in enumerate(self.feature_names):
-            ttk.Label(self.input_frame, text=f"{feature} :").grid(row=i, column=0, padx=10, pady=8, sticky="w")
-            if feature == 'Sexe':
-                entry = ttk.Combobox(self.input_frame, values=["Homme", "Femme"], width=15, state="readonly")
-                entry.set("Homme")
-            else:
-                entry = ttk.Entry(self.input_frame, width=15)
-                entry.insert(0, "30")
-            entry.grid(row=i, column=1, padx=10, pady=8)
-            self.input_entries.append(entry)
-
-        ttk.Label(self.input_frame, text="Symptômes (séparés par des virgules) :").grid(row=len(self.feature_names), column=0, padx=10, pady=8, sticky="w")
-        self.symptoms_entry = ttk.Entry(self.input_frame, width=60)
-        self.symptoms_entry.insert(0, "")
-        self.symptoms_entry.grid(row=len(self.feature_names), column=1, padx=10, pady=8)
-
-        ttk.Button(self.input_frame, text="Prédire", command=self.predict).grid(row=len(self.feature_names)+1, column=0, columnspan=2, pady=10)
-
-        self.symptom_tooltip_label = ttk.Label(self.input_frame, text="Symptômes valides : Chargez un dataset pour voir les symptômes", font=("Helvetica", 9), wraplength=600, foreground="#555")
-        self.symptom_tooltip_label.grid(row=len(self.feature_names)+2, column=0, columnspan=2, padx=10, pady=5, sticky="w")
-
-        result_frame = ttk.LabelFrame(self.prediction_frame, text="Résultat de la Prédiction", padding=15)
-        result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        self.prediction_label = ttk.Label(result_frame, text="Entrez les données et cliquez sur Prédire", font=("Helvetica", 14, "bold"), wraplength=900, justify="center")
-        self.prediction_label.pack(pady=10)
-
-        self.prob_figure, self.prob_ax = plt.subplots(figsize=(6, 2), dpi=100)
-        self.prob_canvas = FigureCanvasTkAgg(self.prob_figure, master=result_frame)
-        self.prob_canvas.get_tk_widget().pack(pady=10, fill=tk.X)
-
-    def normalize_text(self, text):
-        text = ''.join(c for c in unicodedata.normalize('NFD', text) if unicodedata.category(c) != 'Mn')
-        return text.lower().strip()
-
-    def map_symptoms(self, input_symptoms):
-        mapped_symptoms = []
-        for symptom in input_symptoms:
-            if symptom.lower() == "aucun symptôme":
-                return []
+        
+        if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
+            self.model = load_model(MODEL_PATH)
+            with open(VECTORIZER_PATH, 'rb') as f:
+                self.vectorizer = pickle.load(f)
+        
+        self.style = ttk.Style()
+        self.style.configure("TButton", font=("Helvetica", 12), padding=10, background="#4CAF50")
+        self.style.configure("TLabel", font=("Helvetica", 12), background="#f0f4f8")
+        
+        self.main_frame = Frame(root, bg="#f0f4f8")
+        self.main_frame.pack(padx=20, pady=20, fill="both", expand=True)
+        
+        self.label = Label(self.main_frame, text="Analyseur de Maladies en Temps Réel", 
+                          font=("Helvetica", 22, "bold"), bg="#f0f4f8", fg="#2c3e50")
+        self.label.pack(pady=(0, 20))
+        
+        self.notebook = ttk.Notebook(self.main_frame)
+        self.notebook.pack(pady=10, fill="both", expand=True)
+        
+        self.prediction_tab = Frame(self.notebook, bg="#f0f4f8")
+        self.notebook.add(self.prediction_tab, text="Prédiction")
+        
+        self.training_tab = Frame(self.notebook, bg="#f0f4f8")
+        self.notebook.add(self.training_tab, text="Entraînement")
+        
+        self.prediction_frame = Frame(self.prediction_tab, bg="#ffffff", bd=2, relief="flat", padx=10, pady=10)
+        self.prediction_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        Label(self.prediction_frame, text="Section de Prédiction", font=("Helvetica", 14, "bold"), bg="#ffffff").pack(anchor="w", pady=5)
+        
+        self.text_label = Label(self.prediction_frame, text="Décrivez vos symptômes :", font=("Helvetica", 12), bg="#ffffff")
+        self.text_label.pack(anchor="w", padx=5, pady=5)
+        
+        self.text_frame = Frame(self.prediction_frame, bg="#ffffff")
+        self.text_frame.pack(fill="both", expand=True)
+        self.text_entry = tk.Text(self.text_frame, height=5, width=60, font=("Helvetica", 12), bd=1, relief="solid", wrap="word")
+        self.text_entry.pack(side="left", fill="both", expand=True)
+        text_scrollbar = Scrollbar(self.text_frame, orient="vertical", command=self.text_entry.yview)
+        text_scrollbar.pack(side="right", fill="y")
+        self.text_entry.config(yscrollcommand=text_scrollbar.set)
+        
+        self.text_entry.bind('<KeyRelease>', self.real_time_predict)
+        
+        self.result_label = Label(self.prediction_frame, text="Maladie : En attente...", 
+                                font=("Helvetica", 14, "bold"), bg="#ffffff", fg="#2c3e50")
+        self.result_label.pack(pady=10)
+        
+        self.fig, self.ax = plt.subplots(figsize=(8, 4), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.prediction_frame)
+        self.canvas.get_tk_widget().pack(pady=10)
+        
+        self.training_frame = Frame(self.training_tab, bg="#ffffff", bd=2, relief="flat", padx=10, pady=10)
+        self.training_frame.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        Label(self.training_frame, text="Section d'Entraînement", font=("Helvetica", 14, "bold"), bg="#ffffff").pack(anchor="w", pady=5)
+        
+        self.log_text = Text(self.training_frame, height=8, width=80, font=("Helvetica", 10), bd=1, relief="solid")
+        self.log_text.pack(fill="both", expand=True, padx=5, pady=5)
+        log_scrollbar = Scrollbar(self.training_frame, orient="vertical", command=self.log_text.yview)
+        log_scrollbar.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=log_scrollbar.set)
+        
+        class TextHandler(logging.Handler):
+            def __init__(self, text_widget):
+                super().__init__()
+                self.text_widget = text_widget
             
-            normalized_symptom = self.normalize_text(symptom)
-            choices = [self.normalize_text(s) for s in self.symptom_names]
-            if not choices:
-                self.prediction_label.config(text="Erreur : Aucun symptôme disponible. Chargez un dataset.", foreground="#dc3545")
-                return None
-            
-            match, score = process.extractOne(normalized_symptom, choices, scorer=fuzz.token_sort_ratio)
-            if score >= 80:  # Seuil de similarité
-                mapped_symptoms.append(self.symptom_names[choices.index(match)])
+            def emit(self, record):
+                msg = self.format(record)
+                self.text_widget.insert(tk.END, msg + "\n")
+                self.text_widget.see(tk.END)
+        
+        logger.addHandler(TextHandler(self.log_text))
+        
+        self.control_frame = Frame(self.training_frame, bg="#ffffff")
+        self.control_frame.pack(pady=10)
+        
+        self.clear_button = ttk.Button(self.control_frame, text="Effacer", command=self.clear_text)
+        self.clear_button.pack(side="left", padx=5)
+        
+        self.retrain_button = ttk.Button(self.control_frame, text="Réentraîner", command=self.retrain_model, 
+                                        state="normal" if self.model else "disabled")
+        self.retrain_button.pack(side="left", padx=5)
+        
+        self.load_csv_button = ttk.Button(self.control_frame, text="Charger CSV", command=self.load_csv)
+        self.load_csv_button.pack(side="left", padx=5)
+        
+        self.save_model_button = ttk.Button(self.control_frame, text="Sauvegarder Modèle", command=self.save_model, 
+                                           state="normal" if self.model else "disabled")
+        self.save_model_button.pack(side="left", padx=5)
+        
+        self.metrics_label = Label(self.training_frame, text="Métriques : Non disponible", 
+                                 font=("Helvetica", 12), bg="#ffffff", fg="#2c3e50")
+        self.metrics_label.pack(pady=5)
+        
+        self.progress_frame = Frame(self.training_frame, bg="#ffffff")
+        self.progress_frame.pack(fill="x", padx=10, pady=5)
+        self.progress = ttk.Progressbar(self.progress_frame, mode="determinate", maximum=100)
+        self.progress.pack(fill="x")
+        
+        self.status_label = Label(self.main_frame, text="Modèle prêt" if self.model else "Chargez un fichier CSV pour commencer", 
+                                font=("Helvetica", 10), bg="#d1e7f0", fg="#2c3e50", bd=1, relief="sunken", anchor="w")
+        self.status_label.pack(fill="x", padx=10, pady=5)
+        
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.rowconfigure(2, weight=1)
+        self.prediction_frame.columnconfigure(0, weight=1)
+        self.prediction_frame.rowconfigure(2, weight=1)
+        self.training_frame.columnconfigure(0, weight=1)
+        self.training_frame.rowconfigure(1, weight=1)
+        self.text_frame.columnconfigure(0, weight=1)
+        self.text_frame.rowconfigure(0, weight=1)
+        
+        self.plot_probabilities(np.zeros(len(DISEASES)))
+    
+    def update_progress(self, value):
+        self.progress['value'] = value
+        self.status_label.config(text=f"Entraînement en cours... {value:.1f}%")
+        self.root.update()
+    
+    def update_log(self, message):
+        self.log_text.insert(tk.END, f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - {message}\n")
+        self.log_text.see(tk.END)
+    
+    def plot_probabilities(self, probabilities, predicted_disease=None):
+        self.ax.clear()
+        colors = ["#FF6384", "#36A2EB", "#FFCE56", "#4BC0C0"]
+        bars = self.ax.bar(DISEASES, probabilities, color=colors, edgecolor="black")
+        self.ax.set_ylim(0, 1)
+        self.ax.set_title("Probabilités des Maladies", fontweight="bold", fontsize=12)
+        self.ax.set_ylabel("Probabilité", fontsize=10)
+        self.ax.set_xlabel("Maladies", fontsize=10)
+        plt.xticks(rotation=45, fontsize=9)
+        for i, bar in enumerate(bars):
+            yval = bar.get_height()
+            if predicted_disease == DISEASES[i]:
+                bar.set_color("#FF0000")
+            self.ax.text(bar.get_x() + bar.get_width()/2, yval + 0.02, f"{yval:.2f}", 
+                         ha="center", va="bottom", fontsize=8)
+        plt.tight_layout()
+        self.canvas.draw()
+    
+    def plot_confusion_matrix(self, cm, classes):
+        self.ax.clear()
+        self.ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+        self.ax.set_title("Matrice de Confusion")
+        tick_marks = np.arange(len(classes))
+        self.ax.set_xticks(tick_marks, classes, rotation=45)
+        self.ax.set_yticks(tick_marks, classes)
+        fmt = 'd'
+        thresh = cm.max() / 2.
+        for i, j in np.ndindex(cm.shape):
+            self.ax.text(j, i, format(cm[i, j], fmt),
+                         ha="center", va="center",
+                         color="white" if cm[i, j] > thresh else "black")
+        self.ax.set_ylabel('Étiquette réelle')
+        self.ax.set_xlabel('Étiquette prédite')
+        plt.tight_layout()
+        self.canvas.draw()
+    
+    def plot_training_history(self, history):
+        self.ax.clear()
+        if isinstance(history, dict) and 'history' in history:
+            history = history['history'][0]  # Premier fold pour la visualisation
+        epochs = range(1, len(history['loss']) + 1)
+        self.ax.plot(epochs, history['loss'], 'b-', label='Perte entraînement')
+        self.ax.plot(epochs, history['val_loss'], 'r-', label='Perte validation')
+        self.ax.plot(epochs, history['accuracy'], 'b--', label='Précision entraînement')
+        self.ax.plot(epochs, history['val_accuracy'], 'r--', label='Précision validation')
+        self.ax.set_title("Courbes d'apprentissage")
+        self.ax.set_xlabel("Époques")
+        self.ax.set_ylabel("Valeur")
+        self.ax.legend()
+        plt.tight_layout()
+        self.canvas.draw()
+    
+    def initialize_model(self):
+        if self.model is not None and self.vectorizer is not None:
+            self.status_label.config(text="Modèle pré-entraîné chargé")
+            self.retrain_button.config(state="normal")
+            self.save_model_button.config(state="normal")
+            self.update_log("Modèle pré-entraîné chargé avec succès")
+            return
+        
+        if not self.training_texts or not self.training_labels:
+            self.status_label.config(text="Aucune donnée d'entraînement disponible")
+            self.update_log("Erreur : Aucune donnée d'entraînement disponible")
+            messagebox.showerror("Erreur", "Aucune donnée d'entraînement disponible. Veuillez charger un fichier CSV.")
+            return
+        try:
+            self.progress['value'] = 0
+            self.progress.pack()
+            self.progress.start()
+            text_dim = len(self.vectorizer.vocabulary_)
+            self.model, self.history = create_and_train_model(text_dim, self.training_texts, self.training_labels, 
+                                                            self.test_texts, self.test_labels, 
+                                                            self.update_progress, self.update_log, self)
+            if self.model is None:
+                messagebox.showerror("Erreur", "Échec de l'initialisation du modèle. Vérifiez les données ou les paramètres.")
+                self.status_label.config(text="Erreur d'initialisation du modèle")
+                self.update_log("Erreur : Échec de l'initialisation du modèle")
             else:
-                self.prediction_label.config(
-                    text=f"Symptôme '{symptom}' non reconnu. Essayez : {', '.join(self.symptom_names[:5])}...",
-                    foreground="#dc3545"
-                )
-                return None
-        return mapped_symptoms
-
-    def load_dataset(self, file_path=None):
-        if not file_path:
-            file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
+                val_accuracy = np.mean(self.history['val_accuracy']) if self.history else 0
+                test_accuracy = self.history.get('test_accuracy', 0)
+                self.metrics_label.config(
+                    text=f"Métriques : Précision validation moyenne = {val_accuracy:.2f}, Précision test = {test_accuracy:.2f}")
+                self.status_label.config(text="Modèle prêt")
+                self.retrain_button.config(state="normal")
+                self.save_model_button.config(state="normal")
+                self.update_log(f"Modèle initialisé avec succès - Précision validation moyenne: {val_accuracy:.2f}, "
+                               f"Précision test: {test_accuracy:.2f}")
+                self.plot_training_history(self.history)
+        except Exception as e:
+            logger.error(f"Erreur lors de l'initialisation du modèle : {e}")
+            messagebox.showerror("Erreur", f"Échec de l'initialisation : {str(e)}")
+            self.status_label.config(text="Erreur d'initialisation")
+            self.update_log(f"Erreur : Échec de l'initialisation : {str(e)}")
+        finally:
+            self.progress.stop()
+            self.progress.pack_forget()
+    
+    def real_time_predict(self, event=None):
+        if hasattr(self, '_predict_timer'):
+            self.root.after_cancel(self._predict_timer)
+        self._predict_timer = self.root.after(500, self._perform_prediction)
+    
+    def _perform_prediction(self):
+        if self.model is None or self.vectorizer is None:
+            self.status_label.config(text="Modèle ou vectoriseur non prêt")
+            self.update_log("Erreur : Modèle ou vectoriseur non prêt")
+            messagebox.showerror("Erreur", "Modèle ou vectoriseur non initialisé. Chargez un fichier CSV et entraînez le modèle.")
+            return
+        threading.Thread(target=self._predict_thread, daemon=True).start()
+    
+    def _predict_thread(self):
+        try:
+            text = self.text_entry.get("1.0", tk.END).strip()
+            if len(text) < 3:
+                self.root.after(0, lambda: self.result_label.config(text="Maladie : En attente..."))
+                self.root.after(0, lambda: self.plot_probabilities(np.zeros(len(DISEASES))))
+                self.root.after(0, lambda: self.status_label.config(text="En attente de texte suffisant..."))
+                return
+            
+            self.root.after(0, lambda: self.status_label.config(text="Analyse en cours..."))
+            disease, probabilities = predict_disease(self.model, text, self.vectorizer)
+            if disease and probabilities is not None:
+                self.root.after(0, lambda: self.result_label.config(text=f"Maladie : {disease}"))
+                self.root.after(0, lambda: self.plot_probabilities(probabilities, disease))
+                self.root.after(0, lambda: self.status_label.config(text=f"Prédiction : {disease}"))
+                self.update_log(f"Prédiction réussie : {disease} (Probabilités: {probabilities})")
+            else:
+                self.root.after(0, lambda: self.result_label.config(text="Maladie : Erreur"))
+                self.root.after(0, lambda: self.status_label.config(text="Erreur lors de la prédiction"))
+                self.update_log("Erreur : Échec de la prédiction")
+        except Exception as e:
+            logger.error(f"Erreur dans la prédiction en temps réel : {e}")
+            self.root.after(0, lambda: messagebox.showerror("Erreur", f"Erreur lors de la prédiction : {str(e)}"))
+            self.root.after(0, lambda: self.status_label.config(text="Erreur lors de la prédiction"))
+            self.update_log(f"Erreur : Prédiction en temps réel échouée : {str(e)}")
+    
+    def clear_text(self):
+        self.text_entry.delete("1.0", tk.END)
+        self.result_label.config(text="Maladie : En attente...")
+        self.plot_probabilities(np.zeros(len(DISEASES)))
+        self.status_label.config(text="Texte effacé")
+        self.update_log("Texte effacé")
+    
+    def load_csv(self):
+        file_path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
         if file_path:
-            try:
-                df = pd.read_csv(file_path)
-                expected_columns = ['Age', 'Sexe', 'Symptômes', 'Maladie']
-                if not all(col in df.columns for col in expected_columns):
-                    messagebox.showerror("Erreur", "Le dataset doit contenir les colonnes : " + ", ".join(expected_columns))
+            self.update_log(f"Chargement du fichier CSV : {file_path}")
+            texts, labels, test_texts, test_labels = load_csv_data(file_path)
+            if texts and labels:
+                self.training_texts = texts
+                self.training_labels = labels
+                self.test_texts = test_texts
+                self.test_labels = test_labels
+                self.vectorizer = initialize_vectorizer(self.training_texts)
+                if self.vectorizer is None:
+                    messagebox.showerror("Erreur", "Échec de l'initialisation du vectoriseur. Vérifiez le format du fichier CSV.")
+                    self.status_label.config(text="Erreur lors du chargement du CSV")
+                    self.update_log("Erreur : Échec de l'initialisation du vectoriseur")
                     return
-
-                df['Symptômes'] = df['Symptômes'].apply(lambda x: x.split(', ') if isinstance(x, str) and x and x != "Aucun symptôme" else [] if x == "Aucun symptôme" else [x])
-                self.symptom_names = sorted(set(symptom for sublist in df['Symptômes'] for symptom in sublist if symptom))
-                if not self.symptom_names:
-                    messagebox.showerror("Erreur", "Aucun symptôme trouvé dans le dataset.")
-                    return
-
-                self.symptom_tooltip_label.config(text=f"Symptômes valides : {', '.join(self.symptom_names[:10])}{'...' if len(self.symptom_names) > 10 else ''}")
-
-                self.mlb.fit([self.symptom_names])
-                X_symptoms = self.mlb.transform(df['Symptômes'])
-                X_base = df[['Age', 'Sexe']].copy()
-                X_base['Sexe'] = X_base['Sexe'].map({'Homme': 0, 'Femme': 1})
-                X = np.hstack((X_base.values, X_symptoms))
-
-                self.classes = sorted(df['Maladie'].unique())
-                self.label_encoder.fit(self.classes)
-                y = self.label_encoder.transform(df['Maladie'])
-
-                self.class_colors = {cls: self.default_colors[i % len(self.default_colors)] for i, cls in enumerate(self.classes)}
-
-                self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-                self.X_train = self.scaler.fit_transform(self.X_train)
-                self.X_test = self.scaler.transform(self.X_test)
-
-                messagebox.showinfo("Succès", f"Dataset chargé avec succès ! {len(self.symptom_names)} symptômes et {len(self.classes)} maladies détectés.")
-            except Exception as e:
-                messagebox.showerror("Erreur", f"Erreur lors du chargement : {str(e)}")
-
-    def train_model(self):
-        if self.X_train is None or self.y_train is None:
-            messagebox.showerror("Erreur", "Veuillez d'abord charger un dataset !")
-            return
-
+                self.status_label.config(text="Données CSV chargées, entraînement en cours...")
+                self.retrain_button.config(state="normal")
+                self.save_model_button.config(state="normal")
+                self.update_log("Données CSV chargées avec succès")
+                self.initialize_model()
+            else:
+                messagebox.showerror("Erreur", "Échec du chargement du fichier CSV. Vérifiez le format et les colonnes.")
+                self.update_log("Erreur : Échec du chargement du fichier CSV")
+    
+    def retrain_model(self):
+        self.status_label.config(text="Réentraînement du modèle...")
+        self.retrain_button.config(state="disabled")
+        self.load_csv_button.config(state="disabled")
+        self.save_model_button.config(state="disabled")
+        self.progress.pack()
+        self.progress['value'] = 0
+        self.update_log("Démarrage du réentraînement du modèle")
+        threading.Thread(target=self._retrain_model_thread, daemon=True).start()
+    
+    def _retrain_model_thread(self):
         try:
-            epochs = int(self.epochs_entry.get())
-            batch_size = int(self.batch_size_entry.get())
-
-            if epochs <= 0 or batch_size <= 0:
-                messagebox.showerror("Erreur", "Les époques et la taille du lot doivent être des nombres positifs !")
+            if os.path.exists(MODEL_PATH):
+                os.remove(MODEL_PATH)
+            if os.path.exists(VECTORIZER_PATH):
+                os.remove(VECTORIZER_PATH)
+            
+            self.vectorizer = initialize_vectorizer(self.training_texts)
+            if self.vectorizer is None:
+                self.root.after(0, lambda: messagebox.showerror("Erreur", "Échec de l'initialisation du vectoriseur."))
+                self.root.after(0, lambda: self.status_label.config(text="Erreur de réentraînement"))
+                self.update_log("Erreur : Échec de l'initialisation du vectoriseur")
                 return
-
-            self.model = Sequential([
-                Dense(32, activation='relu', input_shape=(self.X_train.shape[1],)),
-                Dropout(0.3),
-                Dense(16, activation='relu'),
-                Dropout(0.2),
-                Dense(8, activation='relu'),
-                Dense(len(self.classes), activation='softmax')
-            ])
-
-            self.model.compile(optimizer='adam', loss='sparse_categorical_crossentropy', metrics=['accuracy'])
-
-            log_stream = io.StringIO()
-            with redirect_stdout(log_stream):
-                self.history = self.model.fit(
-                    self.X_train, self.y_train,
-                    epochs=epochs,
-                    batch_size=batch_size,
-                    validation_data=(self.X_test, self.y_test),
-                    verbose=1
-                )
-            logs = log_stream.getvalue()
-            self.log_text.delete(1.0, tk.END)
-            self.log_text.insert(tk.END, logs)
-
-            loss, accuracy = self.model.evaluate(self.X_test, self.y_test, verbose=0)
-            self.result_label.config(text=f"Précision sur test : {accuracy*100:.2f}%")
-
-            self.ax.clear()
-            self.ax.plot(self.history.history['accuracy'], label='Précision entraînement', color='#007bff')
-            self.ax.plot(self.history.history['val_accuracy'], label='Précision validation', color='#28a745')
-            self.ax.plot(self.history.history['loss'], label='Perte entraînement', linestyle='--', color='#007bff')
-            self.ax.plot(self.history.history['val_loss'], label='Perte validation', linestyle='--', color='#28a745')
-            self.ax.set_title('Courbes d\'Apprentissage', fontsize=12, fontweight='bold')
-            self.ax.set_xlabel('Époque')
-            self.ax.set_ylabel('Valeur')
-            self.ax.legend()
-            self.ax.grid(True, linestyle='--', alpha=0.7)
-            self.canvas.draw()
-
-            messagebox.showinfo("Succès", "Modèle entraîné avec succès !")
-        except ValueError as e:
-            messagebox.showerror("Erreur", "Veuillez vérifier les paramètres d'entraînement (époques et taille du lot doivent être des nombres entiers).")
+            
+            text_dim = len(self.vectorizer.vocabulary_)
+            self.model, self.history = create_and_train_model(text_dim, self.training_texts, self.training_labels, 
+                                                            self.test_texts, self.test_labels, 
+                                                            self.update_progress, self.update_log, self)
+            if self.model is None:
+                self.root.after(0, lambda: messagebox.showerror("Erreur", "Échec du réentraînement du modèle."))
+                self.root.after(0, lambda: self.status_label.config(text="Erreur de réentraînement"))
+                self.update_log("Erreur : Échec du réentraînement du modèle")
+            else:
+                val_accuracy = np.mean(self.history['val_accuracy']) if self.history else 0
+                test_accuracy = self.history.get('test_accuracy', 0)
+                self.root.after(0, lambda: self.metrics_label.config(
+                    text=f"Métriques : Précision validation moyenne = {val_accuracy:.2f}, Précision test = {test_accuracy:.2f}"))
+                self.root.after(0, lambda: self.status_label.config(text="Modèle réentraîné avec succès"))
+                self.update_log(f"Modèle réentraîné avec succès - Précision validation moyenne: {val_accuracy:.2f}, "
+                               f"Précision test: {test_accuracy:.2f}")
+                self.root.after(0, lambda: self.plot_training_history(self.history))
         except Exception as e:
-            messagebox.showerror("Erreur", f"Erreur lors de l'entraînement : {str(e)}")
-
-    def predict(self):
+            logger.error(f"Erreur lors du réentraînement : {e}")
+            self.root.after(0, lambda: messagebox.showerror("Erreur", f"Échec du réentraînement : {str(e)}"))
+            self.root.after(0, lambda: self.status_label.config(text="Erreur de réentraînement"))
+            self.update_log(f"Erreur : Réentraînement échoué : {str(e)}")
+        finally:
+            self.root.after(0, lambda: self.retrain_button.config(state="normal"))
+            self.root.after(0, lambda: self.load_csv_button.config(state="normal"))
+            self.root.after(0, lambda: self.save_model_button.config(state="normal"))
+            self.root.after(0, lambda: self.progress.stop())
+            self.root.after(0, lambda: self.progress.pack_forget())
+    
+    def save_model(self):
         if self.model is None:
-            self.prediction_label.config(text="Veuillez entraîner le modèle d'abord !", foreground="#555")
+            messagebox.showerror("Erreur", "Aucun modèle à sauvegarder. Entraînez un modèle d'abord.")
+            self.update_log("Erreur : Aucun modèle à sauvegarder")
             return
-
-        try:
-            inputs = []
-            for i, entry in enumerate(self.input_entries):
-                value = entry.get().strip()
-                if self.feature_names[i] == 'Sexe':
-                    if value not in ['Homme', 'Femme']:
-                        self.prediction_label.config(text="Erreur : Sélectionnez un sexe valide (Homme ou Femme)", foreground="#dc3545")
-                        return
-                    value = 1 if value == 'Femme' else 0
-                else:
-                    try:
-                        value = float(value)
-                        if value < 0:
-                            raise ValueError("L'âge doit être positif.")
-                    except ValueError:
-                        self.prediction_label.config(text="Erreur : L'âge doit être un nombre valide", foreground="#dc3545")
-                        return
-                inputs.append(value)
-
-            symptoms = [s.strip() for s in self.symptoms_entry.get().split(',') if s.strip()]
-            if not symptoms and self.symptoms_entry.get().strip() != "Aucun symptôme":
-                self.prediction_label.config(text="Erreur : Entrez au moins un symptôme ou 'Aucun symptôme'", foreground="#dc3545")
-                return
-
-            mapped_symptoms = self.map_symptoms(symptoms)
-            if mapped_symptoms is None:
-                return
-
-            symptoms_encoded = self.mlb.transform([mapped_symptoms])[0]
-            inputs = np.hstack((inputs, symptoms_encoded)).reshape(1, -1)
-            inputs = self.scaler.transform(inputs)
-
-            prediction = self.model.predict(inputs, verbose=0)
-            predicted_class = self.label_encoder.inverse_transform([np.argmax(prediction[0])])[0]
-            probabilities = prediction[0]
-
-            result_text = f"Prédiction : {predicted_class}"
-            self.prediction_label.config(text=result_text, foreground=self.class_colors.get(predicted_class, '#000000'))
-
-            self.prob_ax.clear()
-            bars = self.prob_ax.bar(self.classes, probabilities, color=[self.class_colors.get(cls, '#000000') for cls in self.classes], alpha=0.8)
-            self.prob_ax.set_ylim(0, 1)
-            self.prob_ax.set_title('Probabilités des Prédictions', fontsize=12, fontweight='bold')
-            self.prob_ax.set_ylabel('Probabilité')
-            for bar, prob in zip(bars, probabilities):
-                self.prob_ax.text(bar.get_x() + bar.get_width()/2, bar.get_height(), f'{prob:.2f}', 
-                                 ha='center', va='bottom', fontsize=10)
-            self.prob_ax.grid(True, axis='y', linestyle='--', alpha=0.7)
-            self.prob_canvas.draw()
-
-        except Exception as e:
-            self.prediction_label.config(text=f"Erreur lors de la prédiction : {str(e)}", foreground="#dc3545")
+        file_path = filedialog.asksaveasfilename(defaultextension=".keras", filetypes=[("Keras Model", "*.keras")])
+        if file_path:
+            self.model.save(file_path)
+            self.status_label.config(text=f"Modèle sauvegardé à {file_path}")
+            self.update_log(f"Modèle sauvegardé à {file_path}")
+    
+    def destroy(self):
+        self.root.destroy()
 
 if __name__ == "__main__":
     root = tk.Tk()
-    app = DiseasePredictionApp(root)
+    app = DiseaseApp(root)
+    root.protocol("WM_DELETE_WINDOW", app.destroy)
     root.mainloop()
