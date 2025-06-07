@@ -28,29 +28,23 @@ import random
 import csv
 import seaborn as sns
 
-# Désactiver oneDNN pour éviter les messages inutiles
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
-# Télécharger les ressources nécessaires
 nltk.download('stopwords', quiet=True)
 french_stop_words = stopwords.words('french')
 nlp = spacy.load("fr_core_news_sm", disable=['parser', 'ner'])
 
-# Configurer les logs
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger()
 
-# Classes de maladies
 DISEASES = ['grippe', 'rhume', 'gastroentérite', 'migraine']
 label_encoder = LabelEncoder()
 label_encoder.fit(DISEASES)
 
-# Chemins pour sauvegarder le modèle et le vectoriseur
 MODEL_PATH = "disease_model.keras"
 VECTORIZER_PATH = "vectorizer.pkl"
 
-# Dictionnaire de synonymes pour l'augmentation
 synonyms = {
     'fièvre': ['température', 'chaleur', 'hyperthermie', 'fébrile'],
     'toux': ['quinte', 'toux sèche', 'toux grasse', 'irritation pulmonaire'],
@@ -60,7 +54,6 @@ synonyms = {
     'nausée': ['envie de vomir', 'malaise', 'écœurement', 'vomissement']
 }
 
-# Nettoyage et prétraitement du texte
 def preprocess_text(text, augment=False):
     try:
         if not isinstance(text, str) or not text.strip():
@@ -84,14 +77,13 @@ def preprocess_text(text, augment=False):
         logger.error(f"Erreur lors du prétraitement : {e}")
         return ""
 
-# Augmentation des données
 def augment_dataset(texts, labels):
     augmented_texts = []
     augmented_labels = []
     for text, label in zip(texts, labels):
         augmented_texts.append(text)
         augmented_labels.append(label)
-        for _ in range(3):  # Générer 3 versions augmentées
+        for _ in range(3):
             aug_text = preprocess_text(text, augment=True)
             if aug_text:
                 words = aug_text.split()
@@ -105,7 +97,6 @@ def augment_dataset(texts, labels):
                 augmented_labels.append(label)
     return augmented_texts, augmented_labels
 
-# Chargement des données CSV
 def load_csv_data(file_path):
     try:
         df = pd.read_csv(file_path, quoting=csv.QUOTE_ALL)
@@ -134,7 +125,6 @@ def load_csv_data(file_path):
         logger.error(f"Erreur lors du chargement du CSV : {e}")
         return None, None, None, None
 
-# Initialisation du vectoriseur
 def initialize_vectorizer(texts):
     try:
         vectorizer = TfidfVectorizer(max_features=2000, stop_words=french_stop_words, ngram_range=(1, 3))
@@ -147,7 +137,6 @@ def initialize_vectorizer(texts):
         logger.error(f"Erreur lors de l'initialisation du vectoriseur : {e}")
         return None
 
-# Extraction des caractéristiques texte
 def extract_text_features(text, vectorizer):
     try:
         text = preprocess_text(text)
@@ -160,7 +149,6 @@ def extract_text_features(text, vectorizer):
         logger.error(f"Erreur dans l'extraction des caractéristiques : {e}")
         return np.zeros((1, len(vectorizer.vocabulary_)))
 
-# Analyse des erreurs
 def analyze_errors(model, vectorizer, test_texts, test_labels):
     X_test = vectorizer.transform(test_texts).toarray()
     y_test = label_encoder.transform(test_labels)
@@ -172,7 +160,6 @@ def analyze_errors(model, vectorizer, test_texts, test_labels):
         logger.info(f"Erreur : Texte='{text}', Vrai={true_label}, Prédit={pred_label}")
     return errors
 
-# Création et entraînement du modèle
 def create_and_train_model(text_dim, training_texts, training_labels, test_texts, test_labels, progress_callback=None, log_callback=None, app=None):
     try:
         if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
@@ -188,7 +175,6 @@ def create_and_train_model(text_dim, training_texts, training_labels, test_texts
         X_test = vectorizer.transform(test_texts).toarray()
         y_test = label_encoder.transform(test_labels)
         
-        # Modèle amélioré
         text_input = Input(shape=(text_dim,), name='text_input')
         x = Dense(128, activation='relu', kernel_regularizer=l2(0.01))(text_input)
         x = BatchNormalization()(x)
@@ -253,7 +239,6 @@ def create_and_train_model(text_dim, training_texts, training_labels, test_texts
         logger.error(f"Erreur lors de l'entraînement : {e}")
         return None, None
 
-# Prédiction
 def predict_disease(model, text, vectorizer):
     try:
         if model is None or vectorizer is None:
@@ -270,7 +255,6 @@ def predict_disease(model, text, vectorizer):
         logger.error(f"Erreur lors de la prédiction : {e}")
         return None, None
 
-# Interface Tkinter
 class DiseaseApp:
     def __init__(self, root):
         self.root = root
@@ -286,39 +270,31 @@ class DiseaseApp:
         self.test_labels = []
         self.history = None
         
-        # Charger le modèle et le vectoriseur si existants
         if os.path.exists(MODEL_PATH) and os.path.exists(VECTORIZER_PATH):
             self.model = load_model(MODEL_PATH)
             with open(VECTORIZER_PATH, 'rb') as f:
                 self.vectorizer = pickle.load(f)
         
-        # Style de l'interface
         self.style = ttk.Style()
         self.style.configure("TButton", font=("Helvetica", 12), padding=10)
         self.style.configure("TLabel", font=("Helvetica", 12), background="#e6effa")
         
-        # Frame principal
         self.main_frame = Frame(root, bg="#e6effa")
         self.main_frame.pack(padx=20, pady=20, fill="both", expand=True)
         
-        # Titre
         self.label = Label(self.main_frame, text="Analyseur de Maladies IA", 
                           font=("Helvetica", 24, "bold"), bg="#e6effa", fg="#1a3c5e")
         self.label.pack(pady=(0, 20))
         
-        # Notebook pour les onglets
         self.notebook = ttk.Notebook(self.main_frame)
         self.notebook.pack(pady=10, fill="both", expand=True)
         
-        # Onglet Prédiction
         self.prediction_tab = Frame(self.notebook, bg="#e6effa")
         self.notebook.add(self.prediction_tab, text="Prédiction")
         
-        # Onglet Entraînement
         self.training_tab = Frame(self.notebook, bg="#e6effa")
         self.notebook.add(self.training_tab, text="Entraînement")
         
-        # Frame pour la prédiction
         self.prediction_frame = Frame(self.prediction_tab, bg="#ffffff", bd=2, relief="flat", padx=10, pady=10)
         self.prediction_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
@@ -341,16 +317,13 @@ class DiseaseApp:
                                 font=("Helvetica", 14, "bold"), bg="#ffffff", fg="#1a3c5e")
         self.result_label.pack(pady=10)
         
-        # Graphique des probabilités
         self.fig, self.ax = plt.subplots(figsize=(8, 4), dpi=100)
         self.canvas = FigureCanvasTkAgg(self.fig, master=self.prediction_frame)
         self.canvas.get_tk_widget().pack(pady=10)
         
-        # Bouton pour sauvegarder la prédiction
         self.save_pred_button = ttk.Button(self.prediction_frame, text="Sauvegarder Prédiction", command=self.save_prediction)
         self.save_pred_button.pack(pady=5)
         
-        # Frame pour l'entraînement
         self.training_frame = Frame(self.training_tab, bg="#ffffff", bd=2, relief="flat", padx=10, pady=10)
         self.training_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
@@ -362,7 +335,6 @@ class DiseaseApp:
         log_scrollbar.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=log_scrollbar.set)
         
-        # Handler pour les logs
         class TextHandler(logging.Handler):
             def __init__(self, text_widget):
                 super().__init__()
@@ -375,7 +347,6 @@ class DiseaseApp:
         
         logger.addHandler(TextHandler(self.log_text))
         
-        # Contrôles
         self.control_frame = Frame(self.training_frame, bg="#ffffff")
         self.control_frame.pack(pady=10)
         
@@ -406,7 +377,6 @@ class DiseaseApp:
                                 font=("Helvetica", 10), bg="#c3d7e8", fg="#1a3c5e", bd=1, relief="sunken", anchor="w")
         self.status_label.pack(fill="x", padx=10, pady=5)
         
-        # Configuration des grilles
         self.main_frame.columnconfigure(0, weight=1)
         self.main_frame.rowconfigure(2, weight=1)
         self.prediction_frame.columnconfigure(0, weight=1)
